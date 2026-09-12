@@ -11,15 +11,21 @@ GIGANTUM_URL = os.getenv("GIGANTUM_MCP_URL")
 GIGANTUM_TOKEN = os.getenv("GIGANTUM_AUTH_TOKEN")
 HEADERS = {"Authorization": f"Bearer {GIGANTUM_TOKEN}", "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
 
+_CJK = re.compile(r"[\u4e00-\u9fff]")
+def _is_bad_lang(text):
+    return bool(_CJK.search(text or ""))
+
 SYSTEM_PROMPT = """You are the 'Supergod Financial Council', elite AI hedge-fund manager for IHSG, connected to Gigantum MCP tools.
 RULES:
 1. ALWAYS read conversation history. Resolve 'above/those' FROM HISTORY. NEVER ask 'which stock?' if tickers appeared.
 2. Structure analyses: 1. Expert Macro 2. Gigantum Quant Data 3. Council Debate 4. Final Verdict & Trade Plan.
 3. For DETAILED TRADE PLANS PER TICKER: Demand Zone, Supply Zone, Buy B1/B2/B3, Sell/TP 1/2/3, Support S1/S2/S3, Resistance R1/R2/R3, Entry, Stop Loss, Risk:Reward. Base on tool data.
 4. If asked to export HTML, produce ONE fenced ```html block.
-5. Answer in user's language."""
+5. TOOL-CALL DISCIPLINE: when calling tools, always send valid JSON arguments; send {} when a tool needs none. Never print FUNCTION/ARGS text.
+6. LANGUAGE LOCK: write EVERY output strictly in English or Indonesian (match the user). NEVER output Chinese or any other language."""
 
 MEGA_PROMPT = """Analyze IDX ticker {ticker} using Gigantum tools (predict_symbol, tv_indicators, price_bars, orderbook).
+Write VERDICT and REASONING in Indonesian or English ONLY.
 Output ONLY this strict block, one item per line, prices as plain numbers:
 VERDICT: <BUY/SELL/HOLD + one line>
 B1: <price>
@@ -40,7 +46,7 @@ REASONING: <3-5 sentences council debate summary>"""
 
 async def fetch_mcp_tools():
     async with httpx.AsyncClient(timeout=30.0) as c:
-        await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"supergod","version":"3.0"}}}, headers=HEADERS)
+        await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"supergod","version":"4.0"}}}, headers=HEADERS)
         r = await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}, headers=HEADERS)
         return r.json().get("result", {}).get("tools", [])
 
@@ -60,10 +66,14 @@ async def execute_mcp_tool(name, args):
 def _trim(history):
     return [{"role": m["role"], "content": (m.get("content") or "")[:2500]} for m in (history or [])[-6:] if m.get("role") in ("user","assistant")]
 
-def _chat_with_tools(messages, max_turns=4, tool_result_cap=4000):
-    tools = map_to_openai_tools(asyncio.run(fetch_mcp_tools()))
+def _chat_with_tools(messages, max_turns=4, tool_result_cap=4000, use_tools=True):
+    tools = map_to_openai_tools(asyncio.run(fetch_mcp_tools())) if use_tools else None
     for _ in range(max_turns):
-        resp = client.chat.completions.create(model=os.getenv("QWEN_MODEL","qwen-max"), messages=messages, tools=tools if tools else None, tool_choice="auto")
+        kwargs = {"model": os.getenv("QWEN_MODEL","qwen-max"), "messages": messages}
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        resp = client.chat.completions.create(**kwargs)
         msg = resp.choices[0].message
         if msg.tool_calls:
             messages.append(msg)
@@ -71,17 +81,27 @@ def _chat_with_tools(messages, max_turns=4, tool_result_cap=4000):
                 print(f"⚙️ Tool: {tc.function.name}")
                 try: args = json.loads(tc.function.arguments or "{}")
                 except Exception: args = {}
+                if not isinstance(args, dict): args = {}
                 result = asyncio.run(execute_mcp_tool(tc.function.name, args))
                 messages.append({"role":"tool","tool_call_id":tc.id,"content":result[:tool_result_cap]})
         else:
             return msg.content or ""
     return ""
 
+def _safe_chat(messages, max_turns=4):
+    out = _chat_with_tools(messages, max_turns=max_turns)
+    if _is_bad_lang(out):
+        messages.append({"role":"user","content":"KOREKSI SISTEM: output terakhir tidak valid/salah bahasa. Ulangi sekarang: panggil alat hanya dengan JSON args valid ({} bila kosong), dan tulis SEMUA teks hanya dalam Bahasa Indonesia atau English."})
+        out = _chat_with_tools(messages, max_turns=max_turns)
+    if _is_bad_lang(out):
+        out = _chat_with_tools(messages + [{"role":"user","content":"Answer now in English or Indonesian only. No tool calls."}], max_turns=1, use_tools=False)
+    return out or ""
+
 def run_council(user_id: str, prompt: str, history=None) -> str:
     mem = _trim(history)
     print(f"🔍 Council analyzing (memory turns: {len(mem)}): {prompt[:60]}...")
     messages = [{"role":"system","content":SYSTEM_PROMPT}] + mem + [{"role":"user","content":prompt}]
-    final = _chat_with_tools(messages, max_turns=6, tool_result_cap=6000) or "Council produced no output."
+    final = _safe_chat(messages, max_turns=6) or "Council produced no output."
     try:
         supabase.table("trade_plans").insert({"user_id":user_id,"query":prompt,"full_analysis":final}).execute()
     except Exception as e:
@@ -101,7 +121,7 @@ _FIELDS = ["VERDICT","B1","B2","B3","TP1","TP2","TP3","S1","S2","S3","R1","R2","
 
 def analyze_one(ticker):
     messages = [{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":MEGA_PROMPT.format(ticker=ticker.upper())}]
-    raw = _chat_with_tools(messages)
+    raw = _safe_chat(messages)
     f = {"TICKER": ticker.upper()}
     for key in _FIELDS:
         m = re.search(rf"^{key}:\s*(.+)$", raw, re.MULTILINE | re.IGNORECASE)
@@ -115,7 +135,7 @@ def run_mega_scan(tickers, progress=None):
         try:
             results.append(analyze_one(t))
         except Exception as e:
-            results.append(dict({"TICKER": t.upper(), "RAW": str(e)}, **{k: f"ERROR" if k=="VERDICT" else "—" for k in _FIELDS}))
+            results.append(dict({"TICKER": t.upper(), "RAW": str(e)}, **{k: ("ERROR" if k=="VERDICT" else "—") for k in _FIELDS}))
         if progress: progress(i+1, len(tickers), t.upper())
     return results
 
