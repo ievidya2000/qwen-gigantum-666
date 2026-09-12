@@ -1,6 +1,7 @@
 import os, streamlit as st
 from dotenv import load_dotenv
 from core import run_council, run_mega_scan, build_html_report, parse_ticker_list
+import signals
 
 load_dotenv(".env")
 st.set_page_config(page_title="Supergod IHSG Council", page_icon="🚀", layout="wide")
@@ -94,7 +95,12 @@ if prompt := st.chat_input("Chat normally, or paste 4+ tickers to auto-trigger M
         with st.chat_message("assistant"):
             with st.spinner("🧠 Council reading memory + debating + calling Gigantum tools..."):
                 try:
-                    response = run_council("web_user", prompt, history=history)
+                    hit = signals.handle(prompt, history)
+                    if hit:
+                        response, png = hit
+                        if png: st.image(png, caption="📊 Supergod Quant Chart", use_container_width=True)
+                    else:
+                        response = run_council("web_user", prompt, history=history)
                 except Exception as e:
                     response = f"⚠️ Council error: {type(e).__name__}: {str(e)[:300]}"
             st.markdown(response)

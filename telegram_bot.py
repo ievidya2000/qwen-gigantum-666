@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from core import run_council, run_mega_scan, build_html_report, parse_ticker_list
+import signals
 
 load_dotenv(".env")
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -42,7 +43,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     hist = MEMORY.setdefault(chat_id, [])
     await update.message.chat.send_action(action="typing")
-    response = await asyncio.to_thread(run_council, user_id, text, hist)
+    hit = signals.handle(text, hist)
+    if hit:
+        response = hit[0]
+        if hit[1]:
+            await update.message.reply_photo(photo=hit[1])
+    else:
+        response = await asyncio.to_thread(run_council, user_id, text, hist)
     hist.append({"role":"user","content":text})
     hist.append({"role":"assistant","content":response})
     while len(hist) > CAP: hist.pop(0)
