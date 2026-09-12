@@ -21,11 +21,13 @@ RULES:
 2. Structure analyses: 1. Expert Macro 2. Gigantum Quant Data 3. Council Debate 4. Final Verdict & Trade Plan.
 3. For DETAILED TRADE PLANS PER TICKER: Demand Zone, Supply Zone, Buy B1/B2/B3, Sell/TP 1/2/3, Support S1/S2/S3, Resistance R1/R2/R3, Entry, Stop Loss, Risk:Reward. Base on tool data.
 4. If asked to export HTML, produce ONE fenced ```html block.
-5. TOOL-CALL DISCIPLINE: when calling tools, always send valid JSON arguments; send {} when a tool needs none. Never print FUNCTION/ARGS text.
-6. LANGUAGE LOCK: write EVERY output strictly in English or Indonesian (match the user). NEVER output Chinese or any other language."""
+5. TOOL-CALL DISCIPLINE: when calling tools, always send valid JSON arguments; send {} when a tool needs none.
+6. LANGUAGE LOCK: write EVERY output strictly in English or Indonesian (match the user). NEVER output Chinese or any other language.
+7. NO-QUESTION RULE: NEVER ask confirmation or clarifying questions. Deliver the full answer directly; for long lists work sequentially without asking permission.
+8. NEVER print tool-call JSON (like {"function": ...}) as text; use only the native function-calling channel."""
 
 MEGA_PROMPT = """Analyze IDX ticker {ticker} using Gigantum tools (predict_symbol, tv_indicators, price_bars, orderbook).
-Write VERDICT and REASONING in Indonesian or English ONLY.
+Write VERDICT and REASONING in Indonesian or English ONLY. Do not ask questions.
 Output ONLY this strict block, one item per line, prices as plain numbers:
 VERDICT: <BUY/SELL/HOLD + one line>
 B1: <price>
@@ -46,7 +48,7 @@ REASONING: <3-5 sentences council debate summary>"""
 
 async def fetch_mcp_tools():
     async with httpx.AsyncClient(timeout=30.0) as c:
-        await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"supergod","version":"4.0"}}}, headers=HEADERS)
+        await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"supergod","version":"5.0"}}}, headers=HEADERS)
         r = await c.post(GIGANTUM_URL, json={"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}, headers=HEADERS)
         return r.json().get("result", {}).get("tools", [])
 
@@ -67,13 +69,20 @@ def _trim(history):
     return [{"role": m["role"], "content": (m.get("content") or "")[:2500]} for m in (history or [])[-6:] if m.get("role") in ("user","assistant")]
 
 def _chat_with_tools(messages, max_turns=4, tool_result_cap=4000, use_tools=True):
-    tools = map_to_openai_tools(asyncio.run(fetch_mcp_tools())) if use_tools else None
+    try:
+        tools = map_to_openai_tools(asyncio.run(fetch_mcp_tools())) if use_tools else None
+    except Exception as e:
+        tools = None
+        print(f"⚠️ tool fetch failed: {e}")
     for _ in range(max_turns):
         kwargs = {"model": os.getenv("QWEN_MODEL","qwen-max"), "messages": messages}
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
-        resp = client.chat.completions.create(**kwargs)
+        try:
+            resp = client.chat.completions.create(**kwargs)
+        except Exception as e:
+            return f"⚠️ COUNCIL API ERROR: {type(e).__name__}: {str(e)[:300]}"
         msg = resp.choices[0].message
         if msg.tool_calls:
             messages.append(msg)
@@ -82,7 +91,10 @@ def _chat_with_tools(messages, max_turns=4, tool_result_cap=4000, use_tools=True
                 try: args = json.loads(tc.function.arguments or "{}")
                 except Exception: args = {}
                 if not isinstance(args, dict): args = {}
-                result = asyncio.run(execute_mcp_tool(tc.function.name, args))
+                try:
+                    result = asyncio.run(execute_mcp_tool(tc.function.name, args))
+                except Exception as e:
+                    result = json.dumps({"error": str(e)[:200]})
                 messages.append({"role":"tool","tool_call_id":tc.id,"content":result[:tool_result_cap]})
         else:
             return msg.content or ""
