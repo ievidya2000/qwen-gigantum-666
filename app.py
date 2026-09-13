@@ -105,3 +105,4 @@ if prompt := st.chat_input("Chat normally, or paste 4+ tickers to auto-trigger M
                     response = f"⚠️ Council error: {type(e).__name__}: {str(e)[:300]}"
             st.markdown(response)
             st.session_state.messages.append({"role":"assistant","content":response})
+# force streamlit rebuild Sun Sep 13 17:14:06 WIB 2026
